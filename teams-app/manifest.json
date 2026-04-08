@@ -1,0 +1,42 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.19/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.19",
+  "version": "1.0.0",
+  "id": "YOUR-BOT-APP-ID-HERE",
+  "developer": {
+    "name": "Your Organization",
+    "websiteUrl": "https://your-bot-hostname.example.com",
+    "privacyUrl": "https://your-bot-hostname.example.com/privacy",
+    "termsOfUseUrl": "https://your-bot-hostname.example.com/terms"
+  },
+  "name": {
+    "short": "Transcription Bot",
+    "full": "Meeting Transcription Bot"
+  },
+  "description": {
+    "short": "Transcribes and summarizes meetings",
+    "full": "Add this bot to a Teams meeting to get an AI-generated transcript with speaker identification and a post-meeting summary. All processing happens on-premise — no data leaves the organization."
+  },
+  "icons": {
+    "outline": "icon-outline.png",
+    "color": "icon-color.png"
+  },
+  "accentColor": "#4F46E5",
+  "bots": [
+    {
+      "botId": "YOUR-BOT-APP-ID-HERE",
+      "scopes": ["groupChat", "team"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "supportsCalling": true,
+      "supportsVideo": false
+    }
+  ],
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": [
+    "your-bot-hostname.example.com"
+  ]
+}

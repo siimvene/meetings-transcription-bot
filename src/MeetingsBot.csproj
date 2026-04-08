@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RootNamespace>MeetingsBot</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Microsoft Graph Communications SDK for Teams calling and media -->
+    <PackageReference Include="Microsoft.Graph.Communications.Calls" Version="1.2.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Core" Version="1.2.*" />
+    <PackageReference Include="Microsoft.Graph" Version="5.*" />
+
+    <!-- MSAL for client credentials authentication -->
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.*" />
+
+    <!-- gRPC client for streaming audio to on-premise server -->
+    <PackageReference Include="Grpc.Net.Client" Version="2.*" />
+    <PackageReference Include="Google.Protobuf" Version="3.*" />
+    <PackageReference Include="Grpc.Tools" Version="2.*" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Proto file lives in the sibling meetings-transcription repo.
+      This relative path works when both repos are cloned side-by-side:
+        /Users/siim/git/meetings-transcription/proto/audio_ingestion.proto
+        /Users/siim/git/meetings-transcription-bot/src/MeetingsBot.csproj
+
+      If building standalone, copy the proto file to src/Protos/audio_ingestion.proto
+      and change the Include path below accordingly.
+    -->
+    <Protobuf Include="..\..\meetings-transcription\proto\audio_ingestion.proto"
+              GrpcServices="Client"
+              Link="Protos\audio_ingestion.proto" />
+  </ItemGroup>
+</Project>
