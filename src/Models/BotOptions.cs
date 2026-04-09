@@ -43,6 +43,14 @@ public class BotOptions
     public string CertificatePassword { get; set; } = "";
 
     /// <summary>
+    /// Thumbprint of the certificate in the Windows cert store (LocalMachine\My).
+    /// Used by the media platform for MTLS authentication with Teams media relays.
+    /// If set, takes precedence over CertificatePath for the media platform.
+    /// Get it with: Get-ChildItem Cert:\LocalMachine\My | Select Thumbprint
+    /// </summary>
+    public string CertificateThumbprint { get; set; } = "";
+
+    /// <summary>
     /// Public IP address or FQDN of this machine for media traffic.
     /// Teams media relays connect to this address.
     /// </summary>

@@ -16,6 +16,16 @@
     <!-- MSAL for client credentials authentication -->
     <PackageReference Include="Microsoft.Identity.Client" Version="4.*" />
 
+    <!-- JWT validation for inbound Graph webhook notifications -->
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.*" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.*" />
+
+    <!-- Bot Framework SDK for proactive messaging to meeting chat -->
+    <PackageReference Include="Microsoft.Bot.Builder" Version="4.*" />
+    <PackageReference Include="Microsoft.Bot.Builder.Integration.AspNet.Core" Version="4.*" />
+    <PackageReference Include="Microsoft.Bot.Connector" Version="4.*" />
+
+
     <!-- gRPC client for streaming audio to on-premise server -->
     <PackageReference Include="Grpc.Net.Client" Version="2.*" />
     <PackageReference Include="Google.Protobuf" Version="3.*" />

@@ -13,6 +13,11 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Bot.Builder;
+using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Bot.Connector;
+using Microsoft.Bot.Connector.Authentication;
+using Microsoft.Bot.Schema;
 using Microsoft.Graph;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
@@ -21,6 +26,7 @@ using Microsoft.Graph.Communications.Client.Authentication;
 using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Graph.Communications.Resources;
+using Microsoft.Identity.Client;
 using Microsoft.Skype.Bots.Media;
 using MeetingsBot;
 using MeetingsBot.Models;
@@ -47,9 +53,18 @@ public class BotService
     private readonly ConcurrentDictionary<string, MeetingSession> _activeMeetings = new();
     private readonly ConcurrentDictionary<string, AudioHandler> _audioHandlers = new();
 
+    /// <summary>
+    /// Stores Bot Framework conversation references keyed by chat thread ID.
+    /// Captured when the bot is installed in a meeting chat (conversationUpdate event).
+    /// Used for proactive messaging — no Chat.ReadWrite.All permission needed.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, ConversationReference> _conversationReferences = new();
+
     private ICommunicationsClient? _commsClient;
     private IMediaPlatform? _mediaPlatform;
     private GrpcForwarder? _grpcForwarder;
+    private IBotFrameworkHttpAdapter? _botAdapter;
+    private IConfidentialClientApplication? _msalApp;
 
     public BotService(BotOptions botOptions, IngestionOptions ingestionOptions)
     {
@@ -70,20 +85,33 @@ public class BotService
         // 1. Initialize gRPC forwarder
         _grpcForwarder = new GrpcForwarder(_ingestionOptions);
 
-        // 2. Set up authentication provider using client credentials (app-only)
+        // 2. Initialize MSAL for Graph API token acquisition (used for reading chat via RSC)
+        _msalApp = ConfidentialClientApplicationBuilder
+            .Create(_botOptions.AppId)
+            .WithClientSecret(_botOptions.AppSecret)
+            .WithAuthority($"https://login.microsoftonline.com/{_botOptions.TenantId}")
+            .Build();
+
+        // 3. Initialize Bot Framework adapter for proactive messaging to meeting chats.
+        // This replaces Graph API POST /chats/{id}/messages and eliminates Chat.ReadWrite.All.
+        _botAdapter = new BotFrameworkHttpAdapter(
+            new SimpleCredentialProvider(_botOptions.AppId, _botOptions.AppSecret));
+
+        // 4. Set up Graph Communications auth provider
         var authProvider = new AuthenticationProvider(
             _botOptions.AppId,
             _botOptions.AppSecret,
-            _botOptions.TenantId);
+            _botOptions.TenantId,
+            _msalApp);
 
-        // 3. Initialize the media platform for application-hosted media
+        // 5. Initialize the media platform for application-hosted media
         // TODO: In production, load a real certificate from _botOptions.CertificatePath.
         // The media platform requires a certificate for SRTP media encryption.
         // For development, you can create a self-signed cert:
         //   New-SelfSignedCertificate -Subject "CN=MeetingsBot" -CertStoreLocation "Cert:\CurrentUser\My"
         _mediaPlatform = CreateMediaPlatform();
 
-        // 4. Build the communications client
+        // 6. Build the communications client
         var builder = new CommunicationsClientBuilder("MeetingsBot", _botOptions.AppId);
         builder.SetAuthenticationProvider(authProvider);
         builder.SetNotificationUrl(new Uri($"{_botOptions.BaseUrl}/api/calls"));
@@ -94,7 +122,7 @@ public class BotService
 
         _commsClient = builder.Build();
 
-        // 5. Register event handlers
+        // 7. Register event handlers
         _commsClient.Calls().OnIncoming += OnIncomingCallReceived;
         _commsClient.Calls().OnUpdated += OnCallUpdated;
 
@@ -146,6 +174,51 @@ public class BotService
             Console.Error.WriteLine($"[BotService] Error processing notification: {ex.Message}");
             context.Response.StatusCode = 500;
             await context.Response.WriteAsync("Internal error");
+        }
+    }
+
+    /// <summary>
+    /// Expose the Bot Framework adapter so Program.cs can wire up the /api/messages endpoint.
+    /// </summary>
+    public IBotFrameworkHttpAdapter BotAdapter => _botAdapter!;
+
+    /// <summary>
+    /// Handle incoming Bot Framework activities (conversationUpdate, message, installationUpdate).
+    /// The key purpose is capturing the ConversationReference when the bot is installed in a
+    /// meeting chat, enabling proactive messaging without Chat.ReadWrite.All.
+    /// </summary>
+    public async Task OnBotFrameworkActivityAsync(ITurnContext turnContext, CancellationToken cancellationToken)
+    {
+        var activity = turnContext.Activity;
+
+        if (activity.Type == ActivityTypes.ConversationUpdate ||
+            activity.Type == ActivityTypes.InstallationUpdate)
+        {
+            // Capture the conversation reference for this meeting chat.
+            // This is the key to proactive messaging — we store the reference
+            // when the bot is installed and reuse it to send summaries later.
+            var conversationRef = activity.GetConversationReference();
+            var chatId = conversationRef.Conversation?.Id ?? "";
+
+            if (!string.IsNullOrEmpty(chatId))
+            {
+                _conversationReferences[chatId] = conversationRef;
+                Console.WriteLine($"[BotService] Captured conversation reference for chat: {chatId}");
+
+                // Mark any active meeting session with this chat as chat-enabled
+                var session = _activeMeetings.Values.FirstOrDefault(s => s.ChatThreadId == chatId);
+                if (session != null)
+                {
+                    session.ChatEnabled = true;
+                    Console.WriteLine($"[BotService] Chat features enabled for meeting: {session.MeetingId}");
+                }
+            }
+
+            if (activity.Type == ActivityTypes.ConversationUpdate &&
+                activity.MembersAdded?.Any(m => m.Id?.Contains(_botOptions.AppId) == true) == true)
+            {
+                Console.WriteLine($"[BotService] Bot installed in meeting chat: {chatId}");
+            }
         }
     }
 
@@ -257,8 +330,21 @@ public class BotService
                     Console.Error.WriteLine($"[BotService] Failed to set recording status: {ex.Message}");
                 }
 
-                // Post intro message to meeting chat
-                if (!string.IsNullOrEmpty(chatThreadId))
+                // Check if bot is installed in this meeting chat (ConversationReference exists).
+                // If yes, enable chat features. If not, the bot runs in voice-only mode.
+                if (!string.IsNullOrEmpty(chatThreadId) && _conversationReferences.ContainsKey(chatThreadId))
+                {
+                    session.ChatEnabled = true;
+                    Console.WriteLine($"[BotService] Chat features enabled (bot installed before call)");
+                }
+                else if (!string.IsNullOrEmpty(chatThreadId))
+                {
+                    Console.WriteLine($"[BotService] Voice-only mode — bot not installed in meeting chat. " +
+                        "Transcript available via web UI only.");
+                }
+
+                // Post intro message to meeting chat (only if chat is available)
+                if (session.ChatEnabled && !string.IsNullOrEmpty(chatThreadId))
                 {
                     await PostToChatAsync(chatThreadId,
                         "📋 **Transkribeerimise bot liitus koosolekuga.** Salvestan ja transkribeerin seda koosolekut.\n\n" +
@@ -397,9 +483,9 @@ public class BotService
 
                 try
                 {
-                    // Fetch chat messages from the meeting thread
+                    // Fetch chat messages (only if bot was installed in the meeting chat)
                     var chatMessages = new List<(string sender, string text, string timestamp)>();
-                    if (!string.IsNullOrEmpty(session.ChatThreadId))
+                    if (session.ChatEnabled && !string.IsNullOrEmpty(session.ChatThreadId))
                     {
                         chatMessages = await FetchChatMessagesAsync(session.ChatThreadId);
                         Console.WriteLine($"[BotService] Fetched {chatMessages.Count} chat messages");
@@ -410,8 +496,8 @@ public class BotService
                         session.MeetingId, session.OwnerAadId, chatMessages);
                     Console.WriteLine($"[BotService] EndMeeting sent for: {session.MeetingTitle}");
 
-                    // Request final summary from the assembly service and post to chat
-                    if (!string.IsNullOrEmpty(session.ChatThreadId))
+                    // Post final summary to chat (only if chat features are available)
+                    if (session.ChatEnabled && !string.IsNullOrEmpty(session.ChatThreadId))
                     {
                         var summary = await RequestSummaryFromAssemblyAsync(session.MeetingId, "final");
                         if (!string.IsNullOrEmpty(summary))
@@ -426,6 +512,10 @@ public class BotService
                                 "✅ **Koosolek lõppes.** Kokkuvõtet genereeritakse, see on saadaval veebiportaalis.");
                         }
                     }
+                    else
+                    {
+                        Console.WriteLine($"[BotService] Voice-only meeting ended. Summary available via web UI.");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -437,7 +527,8 @@ public class BotService
 
     /// <summary>
     /// Fetch all chat messages from the meeting thread via Microsoft Graph API.
-    /// Requires Chat.Read.All application permission with admin consent.
+    /// Uses RSC permission ChatMessage.Read.Chat — scoped to the meeting where the bot is installed.
+    /// No tenant-wide Chat.Read.All needed.
     /// </summary>
     private async Task<List<(string sender, string text, string timestamp)>> FetchChatMessagesAsync(string chatThreadId)
     {
@@ -445,15 +536,19 @@ public class BotService
 
         try
         {
-            // Use Graph API to read the meeting chat
-            // GET https://graph.microsoft.com/v1.0/chats/{chatThreadId}/messages
             using var httpClient = new HttpClient();
 
-            // TODO: Get a proper access token via MSAL (same as AuthenticationProvider)
-            // For now, this is a placeholder — the auth provider needs to supply a token.
-            // var token = await GetAccessTokenAsync();
-            // httpClient.DefaultRequestHeaders.Authorization =
-            //     new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+            // Acquire token via MSAL client credentials flow.
+            // The RSC permission (ChatMessage.Read.Chat) is scoped to the meeting chat
+            // where the bot is installed — declared in the Teams app manifest.
+            if (_msalApp != null)
+            {
+                var tokenResult = await _msalApp.AcquireTokenForClient(
+                    new[] { "https://graph.microsoft.com/.default" })
+                    .ExecuteAsync();
+                httpClient.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", tokenResult.AccessToken);
+            }
 
             // Only fetch messages from when the bot joined (session start).
             // This is important for recurring meetings where the chat thread
@@ -525,44 +620,56 @@ public class BotService
     }
 
     /// <summary>
-    /// Post a message to the meeting chat via Microsoft Graph API.
-    /// Requires Chat.ReadWrite.All application permission.
+    /// Post a message to the meeting chat via Bot Framework proactive messaging.
+    /// Uses the stored ConversationReference — no Graph API permissions needed for sending.
+    /// Falls back to constructing a reference from the chat thread ID if not yet captured.
     /// </summary>
     private async Task PostToChatAsync(string chatThreadId, string markdownMessage)
     {
+        if (_botAdapter == null)
+        {
+            Console.Error.WriteLine("[BotService] Bot adapter not initialized");
+            return;
+        }
+
         try
         {
-            using var httpClient = new HttpClient();
-            // TODO: Get proper access token via MSAL
-            // var token = await GetAccessTokenAsync();
-            // httpClient.DefaultRequestHeaders.Authorization =
-            //     new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
-
-            var url = $"https://graph.microsoft.com/v1.0/chats/{chatThreadId}/messages";
-            var body = new
+            // Look up the stored conversation reference, or build one from the chat thread ID
+            if (!_conversationReferences.TryGetValue(chatThreadId, out var conversationRef))
             {
-                body = new
+                // Fallback: construct a reference from the chat thread ID.
+                // This works when the bot is installed in the meeting but the
+                // conversationUpdate event hasn't been processed yet (e.g., race
+                // condition between call join and bot install events).
+                conversationRef = new ConversationReference
                 {
-                    contentType = "html",
-                    content = markdownMessage
-                        .Replace("**", "<b>", StringComparison.Ordinal)
-                        .Replace("\n", "<br/>")
-                }
-            };
-
-            var json = JsonSerializer.Serialize(body);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            var response = await httpClient.PostAsync(url, content);
-
-            if (response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"[BotService] Posted message to chat {chatThreadId}");
+                    Bot = new ChannelAccount { Id = $"28:{_botOptions.AppId}" },
+                    Conversation = new ConversationAccount { Id = chatThreadId },
+                    ServiceUrl = "https://smba.trafficmanager.net/emea/",
+                    ChannelId = "msteams"
+                };
+                _conversationReferences[chatThreadId] = conversationRef;
+                Console.WriteLine($"[BotService] Built fallback conversation reference for {chatThreadId}");
             }
-            else
-            {
-                Console.Error.WriteLine(
-                    $"[BotService] Failed to post to chat: {response.StatusCode}");
-            }
+
+            await ((BotFrameworkHttpAdapter)_botAdapter).ContinueConversationAsync(
+                _botOptions.AppId,
+                conversationRef,
+                async (turnContext, cancellationToken) =>
+                {
+                    // Convert markdown bold (**text**) to HTML <b>text</b> for Teams rendering
+                    var html = Regex.Replace(markdownMessage, @"\*\*(.+?)\*\*", "<b>$1</b>")
+                        .Replace("\n", "<br/>");
+
+                    var activity = MessageFactory.Text(string.Empty);
+                    activity.TextFormat = "html";
+                    activity.Text = html;
+
+                    await turnContext.SendActivityAsync(activity, cancellationToken);
+                },
+                CancellationToken.None);
+
+            Console.WriteLine($"[BotService] Posted message to chat {chatThreadId} via Bot Framework");
         }
         catch (Exception ex)
         {
@@ -639,40 +746,56 @@ public class BotService
 
     /// <summary>
     /// Creates the media platform configuration for application-hosted media.
-    /// This configures the audio socket for unmixed (per-participant) audio capture.
+    /// Requires a publicly trusted certificate (Let's Encrypt via win-acme).
+    /// The certificate must be in the Windows cert store for MTLS with Teams media relays.
     /// </summary>
     private IMediaPlatform CreateMediaPlatform()
     {
-        // TODO: Load the actual TLS certificate for media encryption.
-        // In production, this should be loaded from _botOptions.CertificatePath.
-        // The certificate must be trusted and its Subject Name must match the bot's FQDN.
-        X509Certificate2? cert = null;
-        if (!string.IsNullOrEmpty(_botOptions.CertificatePath))
+        // Resolve the certificate thumbprint — either from explicit config or from PFX file
+        var thumbprint = _botOptions.CertificateThumbprint;
+
+        if (string.IsNullOrEmpty(thumbprint) && !string.IsNullOrEmpty(_botOptions.CertificatePath))
         {
-            cert = new X509Certificate2(
+            // Load from PFX/PEM file to get the thumbprint
+            var cert = new X509Certificate2(
                 _botOptions.CertificatePath,
                 _botOptions.CertificatePassword);
+            thumbprint = cert.Thumbprint;
+            Console.WriteLine($"[BotService] Loaded certificate from file, thumbprint: {thumbprint}");
         }
 
-        // TODO: Initialize the media platform with proper settings.
-        // The exact API depends on the SDK version installed. In the
-        // PolicyRecordingBot sample, this is done via:
-        //
-        //   var settings = new MediaPlatformSettings {
-        //       MediaPlatformInstanceId = _botOptions.MediaPlatformInstanceId,
-        //       CertificateThumbprint = cert?.Thumbprint,
-        //       ApplicationId = _botOptions.AppId,
-        //       ServiceFqdn = new Uri(_botOptions.BaseUrl).Host,
-        //       MediaPlatformLogger = logger,
-        //   };
-        //   MediaPlatform.Initialize(settings);
-        //   return MediaPlatform.Instance;
-        //
-        // For now, return null — the bot will log but not process media
-        // until the media platform is properly configured with a real certificate
-        // and the correct SDK initialization pattern.
-        Console.WriteLine("[BotService] WARNING: Media platform not initialized — configure certificate and SDK settings");
-        Console.WriteLine($"[BotService] Certificate path: {_botOptions.CertificatePath}");
+        if (string.IsNullOrEmpty(thumbprint))
+        {
+            Console.Error.WriteLine("[BotService] WARNING: No certificate configured — media platform cannot start.");
+            Console.Error.WriteLine("[BotService] Set Bot:CertificateThumbprint or Bot:CertificatePath in appsettings.json.");
+            Console.Error.WriteLine("[BotService] See INSTALLATION.md section 3.4 for win-acme setup.");
+            return null!;
+        }
+
+        var serviceFqdn = new Uri(_botOptions.BaseUrl).Host;
+
+        var instanceSettings = new MediaPlatformInstanceSettings
+        {
+            CertificateThumbprint = thumbprint,
+            InstancePublicIPAddress = System.Net.IPAddress.Parse(
+                _botOptions.MediaPublicAddress),
+            InstancePublicPort = _botOptions.MediaPort,
+            InstanceInternalPort = _botOptions.MediaPort,
+            ServiceFqdn = serviceFqdn,
+        };
+
+        var settings = new MediaPlatformSettings
+        {
+            MediaPlatformInstanceSettings = instanceSettings,
+            ApplicationId = _botOptions.AppId,
+        };
+
+        MediaPlatform.Initialize(settings);
+        Console.WriteLine($"[BotService] Media platform initialized (FQDN: {serviceFqdn}, cert: {thumbprint[..8]}...)");
+
+        // MediaPlatform.Initialize doesn't return an instance — use CreateMediaConfiguration
+        // to verify it's working. The IMediaPlatform interface is satisfied by passing settings
+        // to the CommunicationsClientBuilder instead.
         return null!;
     }
 
@@ -716,6 +839,12 @@ public class MeetingSession
     public TimeSpan ScheduledDuration { get; set; } = TimeSpan.FromMinutes(60);
     public bool HalftimeSummaryPosted { get; set; } = false;
 
+    /// <summary>
+    /// True when the bot app is installed in the meeting chat (not just invited to the call).
+    /// When false, audio capture works but chat read/write is unavailable.
+    /// </summary>
+    public bool ChatEnabled { get; set; } = false;
+
     /// <summary>MSI (Media Source ID) -> Participant info mapping</summary>
     public Dictionary<int, ParticipantInfo> Participants { get; set; } = new();
 }
@@ -730,64 +859,114 @@ public class ParticipantInfo
 }
 
 /// <summary>
-/// Simple authentication provider for Graph Communications SDK using client credentials.
-/// Acquires app-only tokens via MSAL for Microsoft Graph API calls.
+/// Authentication provider for Graph Communications SDK using client credentials via MSAL.
+/// Acquires app-only tokens for outbound requests. Validates JWTs on inbound webhooks.
 /// </summary>
 public class AuthenticationProvider : IRequestAuthenticationProvider
 {
     private readonly string _appId;
     private readonly string _appSecret;
     private readonly string _tenantId;
+    private readonly IConfidentialClientApplication _msalApp;
 
-    public AuthenticationProvider(string appId, string appSecret, string tenantId)
+    // Microsoft's OIDC metadata for Bot Framework token validation.
+    // Keys rotate periodically — ConfigurationManager handles refresh automatically.
+    private Microsoft.IdentityModel.Protocols.ConfigurationManager<
+        Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>? _configManager;
+
+    private const string BotFrameworkOpenIdMetadata =
+        "https://login.botframework.com/v1/.well-known/openidconfiguration";
+    private const string GraphOpenIdMetadata =
+        "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration";
+
+    public AuthenticationProvider(string appId, string appSecret, string tenantId, IConfidentialClientApplication msalApp)
     {
         _appId = appId;
         _appSecret = appSecret;
         _tenantId = tenantId;
+        _msalApp = msalApp;
     }
 
     /// <summary>
     /// Authenticate an outbound request by adding a Bearer token.
-    /// Uses client credentials flow (app-only, no user context).
+    /// Uses MSAL client credentials flow (app-only, no user context).
     /// </summary>
     public async Task AuthenticateOutboundRequestAsync(HttpRequestMessage request, string tenantId)
     {
-        // TODO: Use Microsoft.Identity.Client (MSAL) ConfidentialClientApplication
-        // to acquire a token with client credentials:
-        //
-        //   var app = ConfidentialClientApplicationBuilder
-        //       .Create(_appId)
-        //       .WithClientSecret(_appSecret)
-        //       .WithAuthority($"https://login.microsoftonline.com/{_tenantId}")
-        //       .Build();
-        //   var result = await app.AcquireTokenForClient(
-        //       new[] { "https://graph.microsoft.com/.default" })
-        //       .ExecuteAsync();
-        //   request.Headers.Authorization =
-        //       new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", result.AccessToken);
-
-        await Task.CompletedTask;
-        Console.WriteLine("[Auth] TODO: Attach Bearer token to outbound request");
+        var result = await _msalApp.AcquireTokenForClient(
+            new[] { "https://graph.microsoft.com/.default" })
+            .ExecuteAsync();
+        request.Headers.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", result.AccessToken);
     }
 
     /// <summary>
     /// Validate an inbound request from Microsoft Graph (webhook callback).
-    /// Verifies the JWT token in the Authorization header.
+    /// Verifies the JWT signature, audience, and issuer against Microsoft's signing keys.
     /// </summary>
     public async Task<RequestValidationResult> ValidateInboundRequestAsync(HttpRequestMessage request)
     {
-        // TODO: Validate the incoming JWT token from Graph notifications.
-        // The token should be verified against Microsoft's signing keys
-        // and checked for the correct audience (this bot's AppId).
-        //
-        // For development, we accept all requests. In production, implement proper validation:
-        //   1. Extract Bearer token from Authorization header
-        //   2. Validate signature using Microsoft's OIDC metadata keys
-        //   3. Verify audience == _appId
-        //   4. Verify issuer == https://api.botframework.com
+        try
+        {
+            // Extract Bearer token from Authorization header
+            var authHeader = request.Headers.Authorization;
+            if (authHeader == null || authHeader.Scheme != "Bearer" || string.IsNullOrEmpty(authHeader.Parameter))
+            {
+                Console.Error.WriteLine("[Auth] Missing or invalid Authorization header");
+                return new RequestValidationResult { IsValid = false };
+            }
 
-        await Task.CompletedTask;
-        return new RequestValidationResult { IsValid = true };
+            var token = authHeader.Parameter;
+
+            // Initialize the OIDC configuration manager (caches and auto-refreshes signing keys)
+            _configManager ??= new Microsoft.IdentityModel.Protocols.ConfigurationManager<
+                Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>(
+                BotFrameworkOpenIdMetadata,
+                new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfigurationRetriever());
+
+            var openIdConfig = await _configManager.GetConfigurationAsync(CancellationToken.None);
+
+            // Also fetch Graph/Entra signing keys (Graph notifications may use either issuer)
+            var graphConfigManager = new Microsoft.IdentityModel.Protocols.ConfigurationManager<
+                Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration>(
+                GraphOpenIdMetadata,
+                new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfigurationRetriever());
+            var graphConfig = await graphConfigManager.GetConfigurationAsync(CancellationToken.None);
+
+            // Combine signing keys from both issuers
+            var allKeys = openIdConfig.SigningKeys.Concat(graphConfig.SigningKeys).ToList();
+
+            var validationParams = new Microsoft.IdentityModel.Tokens.TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidIssuers = new[]
+                {
+                    "https://api.botframework.com",
+                    $"https://sts.windows.net/{_tenantId}/",
+                    $"https://login.microsoftonline.com/{_tenantId}/v2.0"
+                },
+                ValidateAudience = true,
+                ValidAudience = _appId,
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.FromMinutes(5),
+                IssuerSigningKeys = allKeys
+            };
+
+            var handler = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler();
+            handler.ValidateToken(token, validationParams, out _);
+
+            return new RequestValidationResult { IsValid = true };
+        }
+        catch (Microsoft.IdentityModel.Tokens.SecurityTokenException ex)
+        {
+            Console.Error.WriteLine($"[Auth] JWT validation failed: {ex.Message}");
+            return new RequestValidationResult { IsValid = false };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Auth] Unexpected error during JWT validation: {ex.Message}");
+            return new RequestValidationResult { IsValid = false };
+        }
     }
 }
 

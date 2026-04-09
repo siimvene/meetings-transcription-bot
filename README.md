@@ -4,14 +4,28 @@ C# .NET 8 bot that joins Microsoft Teams meetings as an invited participant, cap
 
 ## How It Works
 
-1. User adds **Transcription Bot** as a participant in a Teams meeting
-2. When the meeting starts, Teams calls the bot
-3. Bot auto-answers, requests **unmixed audio** (separate stream per participant)
-4. Identifies speakers by name via the Teams call roster (MSI to identity mapping)
-5. Posts an intro message to the meeting chat
-6. Streams 16kHz PCM audio per participant via gRPC to the GPU server
-7. At meeting halftime, requests a summary from the GPU server and posts it to chat
-8. At meeting end, fetches chat messages, posts the final summary to chat, and signals the GPU server to generate the full summary
+The bot supports two modes depending on how the user adds it:
+
+### Full mode (install app in meeting)
+
+User adds **Transcription Bot** from the Teams app catalog into a meeting. This installs the app in the meeting chat and invites the bot to the call.
+
+1. Bot auto-answers, requests **unmixed audio** (separate stream per participant)
+2. Identifies speakers by name via the Teams call roster
+3. Posts an intro message to the meeting chat
+4. Streams 16kHz PCM audio per participant via gRPC to the GPU server
+5. At meeting halftime, posts an interim summary to chat
+6. At meeting end, fetches chat messages for richer context, posts the final summary to chat
+7. Full transcript and summary available in the web portal
+
+### Voice-only mode (invite only)
+
+User adds the bot as a meeting participant without installing the Teams app. Audio capture works, chat features don't.
+
+1. Bot auto-answers and captures unmixed audio as above
+2. No chat messages (intro, halftime, final summary) are posted
+3. Chat messages from the meeting are not included in the summary context
+4. Transcript and summary available only via the web portal
 
 ## Meeting Chat Messages
 
@@ -32,15 +46,28 @@ C# .NET 8 bot that joins Microsoft Teams meetings as an invited participant, cap
 - TLS certificate (Let's Encrypt via win-acme)
 - Network path to the GPU server (for gRPC on port 50051)
 
-## Azure Entra ID Permissions
+## Permissions
 
-Register as an Application (not Delegated). All require admin consent:
+### Azure Entra ID (Application, admin consent)
 
 | Permission | Purpose |
 |---|---|
 | `Calls.JoinGroupCall.All` | Join meetings when invited |
 | `Calls.AccessMedia.All` | Capture per-participant audio |
-| `Chat.ReadWrite.All` | Read chat messages, post summaries to meeting chat |
+
+### Teams App Manifest (RSC, no admin consent)
+
+These are granted per-meeting when the bot is installed — no tenant-wide access needed:
+
+| Permission | Type | Purpose |
+|---|---|---|
+| `ChatMessage.Read.Chat` | Application | Read chat messages from the meeting the bot is in |
+| `OnlineMeeting.ReadBasic.Chat` | Application | Read meeting metadata |
+
+### Chat messaging
+
+Summaries are posted to meeting chat via **Bot Framework proactive messaging** (`ContinueConversationAsync`),
+not Graph API. This eliminates the need for `Chat.ReadWrite.All` entirely.
 
 ## Configuration
 
@@ -78,9 +105,9 @@ Teams Meeting
 │  BotService                                   │
 │  ├─ OnIncomingCall()     auto-answer          │
 │  ├─ OnParticipantsUpdated()  roster tracking  │
-│  ├─ PostToChatAsync()    chat messages        │
+│  ├─ PostToChatAsync()    Bot Framework proact. │
 │  ├─ OnMidSummaryTimer()  halftime summary     │
-│  ├─ FetchChatMessages()  read meeting chat    │
+│  ├─ FetchChatMessages()  Graph RSC-scoped     │
 │  └─ OnCallTerminated()   final summary        │
 │                                               │
 │  AudioHandler                                 │
